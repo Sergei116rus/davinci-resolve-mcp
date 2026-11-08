@@ -1,0 +1,202 @@
+diff --git a/src/utils/mcp_transport.py b/src/utils/mcp_transport.py
+index 04d5006..73a8ebd 100644
+--- a/src/utils/mcp_transport.py
++++ b/src/utils/mcp_transport.py
+@@ -16,6 +16,12 @@ Security posture:
+ - DNS-rebinding protection follows the bind host (see
+   ``transport_security_for``); a loopback-only allowlist on a LAN bind
+   answered every request with 421 until v4.7.4 (issue #241).
++- A loopback bind still keeps that loopback-only allowlist unless
++  ``$DAVINCI_MCP_ALLOWED_HOSTS`` lists exact names. Those names are then
++  accepted as Host (with or without a port) and as ``http`` and ``https``
++  Origin, which is what a TLS proxy such as Tailscale Serve forwards while
++  the server stays on 127.0.0.1. ``*`` is not an allowlist entry. Protection
++  stays on, and the bearer check still runs first.
+ - Every HTTP request must carry ``Authorization: Bearer <token>`` (constant-time
+   compared); otherwise 401.
+ - stdio (the default transport) is unaffected by anything here.
+@@ -47,13 +53,65 @@ ALLOWED_HOSTS_ENV = "DAVINCI_MCP_ALLOWED_HOSTS"
+ 
+ 
+ def _host_pattern(name: str) -> str:
+-    """`Host`-header pattern for one name: any port, IPv6 literals bracketed."""
++    """`Host`-header pattern for one name: any port, IPv6 literals bracketed.
++
++    The MCP SDK matches this only when the header contains a port
++    (``name:443``). A header that omits the default port does not match; see
++    ``_explicit_name_patterns``.
++    """
+     name = name.strip()
+     if ":" in name and not name.startswith("["):
+         name = f"[{name}]"
+     return f"{name}:*"
+ 
+ 
++def _exact_host_name(raw):
++    """One exact hostname, or None.
++
++    ``DAVINCI_MCP_ALLOWED_HOSTS`` is a list of names, not patterns. ``*``,
++    a DNS wildcard, a URL, or a wildcard bind must not become an allowlist
++    entry. IPv6 literals (which contain colons) are kept.
++    """
++    if not isinstance(raw, str):
++        return None
++    name = raw.strip()
++    if not name or name in WILDCARD_HOSTS or "://" in name:
++        return None
++    if any(c in name for c in "*?/\\#") or any(c.isspace() for c in name):
++        return None
++    # A trailing :port on a DNS name is the same host. Leave IPv6 literals,
++    # which have more than one colon, for _host_pattern to bracket.
++    if ":" in name and not name.startswith("["):
++        host_part, sep, maybe_port = name.rpartition(":")
++        if sep and maybe_port.isdigit() and host_part and ":" not in host_part:
++            name = host_part
++    return name
++
++
++def _explicit_name_patterns(name: str):
++    """Host values and origins for one operator-listed exact name.
++
++    SDK 1.30 ``TransportSecurityMiddleware._validate_host`` / ``_validate_origin``
++    treat ``name:*`` as "the header starts with ``name:``". Browsers and
++    Tailscale Serve omit the default port, so ``Host: name`` and
++    ``Origin: https://name`` need the bare value beside the any-port pattern.
++    Both schemes are listed: the proxy is HTTPS, and an HTTP client of that
++    same name stays allowed. This is not a hostname wildcard.
++    """
++    port_pattern = _host_pattern(name)
++    bare = port_pattern[:-2]
++    hosts = [port_pattern]
++    if bare not in hosts:
++        hosts.append(bare)
++    origins = []
++    for scheme in ("https", "http"):
++        for host_value in (bare, port_pattern):
++            origin = f"{scheme}://{host_value}"
++            if origin not in origins:
++                origins.append(origin)
++    return hosts, origins
++
++
+ def extra_allowed_hosts(env=None):
+     """Names from $DAVINCI_MCP_ALLOWED_HOSTS (comma-separated), stripped, deduped."""
+     raw = (env if env is not None else os.environ).get(ALLOWED_HOSTS_ENV, "")
+@@ -66,11 +124,20 @@ def extra_allowed_hosts(env=None):
+     return out
+ 
+ 
++def _loopback_http_origins():
++    return [f"http://{_host_pattern(n)}" for n in sorted(LOOPBACK_HOSTS)]
++
++
+ def transport_security_for(host, extra_hosts=()):
+     """The DNS-rebinding allowlist the transport should run with for `host`.
+ 
+-    Returns None for a loopback bind: the SDK already pins the allowlist to
+-    loopback when FastMCP is built without a host, and that is correct there.
++    Returns None for a loopback bind with no explicit extra names: the SDK
++    already pins the allowlist to loopback when FastMCP is built without a
++    host, and that is correct there. An explicit ``$DAVINCI_MCP_ALLOWED_HOSTS``
++    entry is honored on loopback too. Tailscale Serve (and any other TLS
++    proxy) terminates HTTPS and connects to 127.0.0.1, forwarding the public
++    hostname as Host and, from a browser, an ``https`` Origin. Ignoring that
++    list left every authenticated proxied request at 421.
+ 
+     Everything else exists because of issue #241. `src/server.py` builds
+     `FastMCP(...)` without a host, so the SDK (1.30.0,
+@@ -83,31 +150,86 @@ def transport_security_for(host, extra_hosts=()):
+     bearer check, so a wrong token still got 401 and the bind looked healthy.
+     A non-loopback bind could never serve anyone.
+ 
++    - Loopback bind with no usable extra names: return None (SDK loopback list).
++    - Loopback bind with exact extra names: protection stays ON. The allowlist
++      is loopback plus those names (any explicit port, and the portless form).
++      Their origins include ``https`` and ``http``. Other hosts stay rejected.
+     - Specific non-loopback host: protection stays ON; the allowlist is the bind
+       host, the loopback names, and any extra names from
+       `$DAVINCI_MCP_ALLOWED_HOSTS` (for clients that reach the box by a DNS name
+-      rather than the bound address).
++      rather than the bound address). Extra names also get the portless form
++      and ``https`` origins.
+     - Wildcard bind (`0.0.0.0` / `::`): a client never sends the wildcard as its
+       Host, so with no extra names there is nothing to allow. Protection is then
+       turned OFF with a warning — the bearer token remains on every request, and
+       a rebinding page does not hold it. Set `$DAVINCI_MCP_ALLOWED_HOSTS` to keep
+-      the protection on for a wildcard bind.
++      the protection on for a wildcard bind. Entries that are not exact names
++      are ignored; if every supplied entry was ignored, protection stays ON
++      pinned to loopback instead of being turned off.
+     """
+     from mcp.server.transport_security import TransportSecuritySettings
+ 
+-    if host in LOOPBACK_HOSTS:
++    extras = []
++    supplied = False
++    for raw in extra_hosts:
++        if isinstance(raw, str) and raw.strip():
++            supplied = True
++        name = _exact_host_name(raw)
++        if name is None:
++            if isinstance(raw, str) and raw.strip():
++                logger.warning(
++                    "Ignoring %s entry %r — only an exact hostname is accepted "
++                    "(no '*', no URL, no wildcard bind).",
++                    ALLOWED_HOSTS_ENV, raw.strip(),
++                )
++            continue
++        if name not in extras:
++            extras.append(name)
++
++    if host in LOOPBACK_HOSTS and not extras:
+         return None
++
+     names = []
+-    if host not in WILDCARD_HOSTS:
++    if host not in WILDCARD_HOSTS and host not in LOOPBACK_HOSTS:
+         names.append(host)
+-    names.extend(n for n in extra_hosts if n not in names)
++    names.extend(n for n in extras if n not in names)
+     if not names:
++        if supplied:
++            # A wildcard bind whose allowlist was only junk must not drop the
++            # Host check. Pin it to loopback; do not install the rejected text.
++            logger.warning(
++                "SECURITY: %s had no usable host name — DNS-rebinding "
++                "protection stays ON, pinned to loopback.",
++                ALLOWED_HOSTS_ENV,
++            )
++            return TransportSecuritySettings(
++                enable_dns_rebinding_protection=True,
++                allowed_hosts=[_host_pattern(n) for n in sorted(LOOPBACK_HOSTS)],
++                allowed_origins=_loopback_http_origins(),
++            )
+         return TransportSecuritySettings(enable_dns_rebinding_protection=False)
+-    names.extend(sorted(LOOPBACK_HOSTS))
++
++    loopback = [n for n in sorted(LOOPBACK_HOSTS) if n not in names]
++    allowed_hosts = [_host_pattern(n) for n in names]
++    allowed_hosts.extend(_host_pattern(n) for n in loopback)
++    # Loopback origins stay the SDK's http port-patterns. https for 127.0.0.1
++    # is not implied by listing a proxy name.
++    allowed_origins = [f"http://{_host_pattern(n)}" for n in names if n not in extras]
++    allowed_origins.extend(_loopback_http_origins())
++
++    for name in extras:
++        host_values, origin_values = _explicit_name_patterns(name)
++        for value in host_values:
++            if value not in allowed_hosts:
++                allowed_hosts.append(value)
++        for origin in origin_values:
++            if origin not in allowed_origins:
++                allowed_origins.append(origin)
++
+     return TransportSecuritySettings(
+         enable_dns_rebinding_protection=True,
+-        allowed_hosts=[_host_pattern(n) for n in names],
+-        allowed_origins=[f"http://{_host_pattern(n)}" for n in names],
++        allowed_hosts=allowed_hosts,
++        allowed_origins=allowed_origins,
+     )
+ 
+ 
