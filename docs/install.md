@@ -268,12 +268,23 @@ The MCP server's own networked transport (`--transport streamable-http` or
 <token>` on every request (`DAVINCI_MCP_TOKEN`, or a generated one). To serve a
 client on another machine, set `DAVINCI_MCP_HOST` to the address to bind and,
 if clients reach the box by a DNS name rather than that address, list the names
-in `DAVINCI_MCP_ALLOWED_HOSTS` (comma-separated). The transport keeps
-DNS-rebinding protection on, pinned to the bind host, loopback, and those
-names; a request whose `Host` header is none of them gets 421. A wildcard bind
-(`0.0.0.0` / `::`) with no names listed turns the Host check off, since a
-client never sends the wildcard as its Host, and the bearer token is then the
-only gate. Restrict a non-loopback bind with a host firewall.
+in `DAVINCI_MCP_ALLOWED_HOSTS` (comma-separated exact hostnames, no `*` and no
+URL). The transport keeps DNS-rebinding protection on, pinned to the bind host,
+loopback, and those names; a request whose `Host` header is none of them gets
+421, and a request whose `Origin` is present but not one of them gets 403.
+
+A loopback bind honors that list too. Keep `DAVINCI_MCP_HOST=127.0.0.1` behind
+Tailscale Serve or another TLS proxy that forwards to loopback, and set
+`DAVINCI_MCP_ALLOWED_HOSTS` to the proxy's exact hostname. The allowlist then
+accepts that hostname with or without a port, and both `https://` and `http://`
+origins of that same name (Serve's client sends `https`, and browsers omit
+`:443`). With the variable unset, a loopback bind stays limited to loopback.
+Do not put `*` in the list, and do not bind a non-loopback address just to
+make the proxy hostname work.
+
+A wildcard bind (`0.0.0.0` / `::`) with no names listed turns the Host check
+off, since a client never sends the wildcard as its Host, and the bearer token
+is then the only gate. Restrict a non-loopback bind with a host firewall.
 
 Run the read-only doctor against Network mode explicitly:
 

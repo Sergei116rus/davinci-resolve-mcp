@@ -1,0 +1,137 @@
+davinci-resolve-mcp 4.19.3 — loopback Tailscale Serve Host/Origin fix
+================================================================
+
+Applies to an installed 4.19.3 tree. One file: src/utils/mcp_transport.py.
+Does not change Resolve projects, timelines, databases, media, or Tailscale
+Funnel. Leave DAVINCI_MCP_HOST=127.0.0.1. Do not bind 100.80.148.53 or any
+other non-loopback address.
+
+SHA256
+------
+Patch file (this diff), docs/patches/4.19.3-tailscale-serve-host.patch:
+  8d67a4cdef2527df19747a0797a7f4e9891a78a2218729ec3f0b47ab0345cea0
+
+Installed 4.19.3 file BEFORE apply (must match, or stop):
+  7e91acdcc5b715d901049e903d1849d08275f09bf506d8dc51f8816f00a86d48
+  src/utils/mcp_transport.py
+
+File AFTER a successful apply:
+  ea71296ae2a746390c38191798e353d34f8e936918b3fb6f44fda5f67c8da616
+  src/utils/mcp_transport.py
+
+If this checkout is already the git branch that contains the fix, do not
+apply the patch. Restart the networked server and use the checks below.
+
+Apply
+-----
+From the installed tree root (the directory that contains src/server.py):
+
+  shasum -a 256 src/utils/mcp_transport.py
+  # expect 7e91acdcc5b715d901049e903d1849d08275f09bf506d8dc51f8816f00a86d48
+
+  cp -p src/utils/mcp_transport.py src/utils/mcp_transport.py.bak-4.19.3
+
+  patch -p1 --dry-run < docs/patches/4.19.3-tailscale-serve-host.patch
+  # dry-run must say "checking file" / succeed with no rejects
+
+  patch -p1 < docs/patches/4.19.3-tailscale-serve-host.patch
+
+  shasum -a 256 src/utils/mcp_transport.py
+  # expect ea71296ae2a746390c38191798e353d34f8e936918b3fb6f44fda5f67c8da616
+
+If dry-run fails, do not force it. Restore is unnecessary because dry-run
+does not write. The installed file is not the 4.19.3 original this patch
+was built from.
+
+Rollback
+--------
+  patch -R -p1 --dry-run < docs/patches/4.19.3-tailscale-serve-host.patch
+  patch -R -p1 < docs/patches/4.19.3-tailscale-serve-host.patch
+
+Or, at any time:
+
+  cp -p src/utils/mcp_transport.py.bak-4.19.3 src/utils/mcp_transport.py
+
+Restart only the networked MCP process afterwards. Do not quit Resolve.
+
+Restart
+-------
+Stop the process that was started as `src/server.py --transport streamable-http`
+(or `sse`) the same way it was started, then start it again with the same
+command and the same environment:
+
+  DAVINCI_MCP_HOST=127.0.0.1
+  DAVINCI_MCP_ALLOWED_HOSTS=macbook-pro.tailfacc7e.ts.net
+  DAVINCI_MCP_TOKEN=<the token you already use>
+
+The value is the hostname only. `*` is ignored. A URL is ignored.
+
+After restart, logs/server.log should contain a line:
+
+  MCP transport Host allowlist:
+
+and that line should include macbook-pro.tailfacc7e.ts.net and 127.0.0.1:*.
+The 4.19.3 process did not log an allowlist for a loopback bind.
+
+Checks (on the Mac, after restart)
+----------------------------------
+Replace the token with the existing one. These hit 127.0.0.1 only.
+
+  # no token -> 401
+  curl -sS -o /dev/null -w '%{http_code}\n' \
+    -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' \
+    -H 'Host: macbook-pro.tailfacc7e.ts.net' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"c","version":"0"}}}' \
+    http://127.0.0.1:8000/mcp
+
+  # bearer + bare Host -> 200
+  curl -sS -o /dev/null -w '%{http_code}\n' \
+    -H "Authorization: Bearer $DAVINCI_MCP_TOKEN" \
+    -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' \
+    -H 'Host: macbook-pro.tailfacc7e.ts.net' \
+    -H 'Origin: https://macbook-pro.tailfacc7e.ts.net' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"c","version":"0"}}}' \
+    http://127.0.0.1:8000/mcp
+
+  # :443 and :8000 -> 200
+  # (repeat with Host macbook-pro.tailfacc7e.ts.net:443 and :8000)
+
+  # other host -> 421
+  curl -sS -o /dev/null -w '%{http_code}\n' \
+    -H "Authorization: Bearer $DAVINCI_MCP_TOKEN" \
+    -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' \
+    -H 'Host: evil.example' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"c","version":"0"}}}' \
+    http://127.0.0.1:8000/mcp
+
+  # local client still works -> 200
+  curl -sS -o /dev/null -w '%{http_code}\n' \
+    -H "Authorization: Bearer $DAVINCI_MCP_TOKEN" \
+    -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' \
+    -H 'Host: 127.0.0.1:8000' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"c","version":"0"}}}' \
+    http://127.0.0.1:8000/mcp
+
+Then from a tailnet client:
+
+  curl -sS -o /dev/null -w '%{http_code}\n' \
+    -H "Authorization: Bearer $DAVINCI_MCP_TOKEN" \
+    -H 'Content-Type: application/json' \
+    -H 'Accept: application/json, text/event-stream' \
+    -H 'Origin: https://macbook-pro.tailfacc7e.ts.net' \
+    -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"c","version":"0"}}}' \
+    https://macbook-pro.tailfacc7e.ts.net/mcp
+
+Expect 200. If the loopback Host checks are 200 and this is still 421, Serve
+is not forwarding that hostname to this process.
+
+What stayed the same
+--------------------
+- Bind stays 127.0.0.1. Bearer is still required on every request (401 first).
+- With DAVINCI_MCP_ALLOWED_HOSTS unset, loopback still allows only loopback.
+- A different Host is 421. A different Origin is 403.
+- stdio is unchanged. The control panel's own Host gate is unchanged.
